@@ -5,3 +5,6 @@ __pycache__/
 .venv/
 venv/
 
+z_test.py
+
+z_test_data/
