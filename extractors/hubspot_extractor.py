@@ -94,6 +94,7 @@ class HubspotExtractor:
                 Bucket = self.s3_bucket,
                 Key = LAST_STATE_RUN_HUBSPOT,
                 Body = json.dumps(state, indent=2),
+                ContentType = "Application/json"
             )
 
             logger.info(f"State update: {records_extracted} records - {status} Status")
