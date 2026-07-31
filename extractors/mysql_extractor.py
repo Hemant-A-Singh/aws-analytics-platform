@@ -2,7 +2,7 @@ import logging
 import json
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
-#import Math
+import math
 import pymysql
 import pymysql.cursors
 import boto3
@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 LAST_STATE_RUN_MYSQL = "logs/pipeline_runs/mysql_state.json"
 CHUNK_SIZE = 1000
 
-TABLE_NAME = ""
-APP_ID_COLUMN = ""
-APPLICATION_DATE= ""
+TABLE_NAME = "applications"
+APP_ID_COLUMN = "app_id"
+APPLICATION_DATE= "app_date"
 MAX_TRIES = 3
 
 COLUMNS = [
@@ -33,10 +33,8 @@ COLUMNS = [
     "Offer",
     "COE",
     "Student_Status",
-    "To_Country",           
+    "To",           
     "Student_ID",
-    "Counsellor",
-    "Admission",
     "Full_Name",
     "Nationality",
     "Lead_Type",
@@ -88,7 +86,7 @@ class MYSQLExtractor:
         try:
             self.connection = pymysql.connect(
                 user= mysql.MYSQL_USER,
-                passwd= mysql.MYSQL_PASSWORD,
+                password= mysql.MYSQL_PASSWORD,
                 port= mysql.MYSQL_PORT,
                 host= mysql.MYSQL_HOST,
                 database= mysql.MYSQL_DATABASE,
@@ -184,14 +182,151 @@ class MYSQLExtractor:
         return sql , params
     
     def _serialize_row(self, row:dict):
-        pass
-    
-    def _extract_all_records(self):
-        pass
 
-    def _upload_to_s3(self):
-        pass
+        serialized = {}
+
+        for key,value in row.items():
+            if isinstance(value, datetime):
+                serialized[key] = value.isoformat()
+            elif hasattr(value, "isoformat"):
+                serialized[key] = value.isoformat()
+            elif value is None:
+                serialized[key] = None
+            else:
+                serialized[key] = str(value) if not isinstance(value, (int, float, bool)) else value
+
+        serialized["run_id"] = self.run_id
+        serialized["_extracted_at"] = datetime.now(timezone.utc).isoformat()
+        return serialized
+        
+    def _extract_all_records(self, last_extracted_at: Optional[str]):
+
+        total_count = self._get_record_count(last_extracted_at)
+        logger.info(f"Total Records Extracted: {total_count}")
+
+        if total_count == 0:
+            return []
+
+        all_records = []
+
+        total_chunks = math.ceil(total_count/CHUNK_SIZE)
+
+        for chunk_num in range(total_chunks):
+            offset = chunk_num * CHUNK_SIZE
+            logger.info(f"Extracting Chunk: {chunk_num + 1} of {total_chunks}, offset: {offset} ")
+
+            sql, params = self._build_query(last_extracted_at= last_extracted_at, offset= offset)
+
+            with self.connection.cursor() as cursor:
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+
+
+            serialized_rows = [self._serialize_row(row) for row in rows]
+            all_records.extend(serialized_rows)
+            logger.info(f"Chunk {chunk_num + 1}: {len(rows)} rows fetched (total so far: {len(all_records)})")
+
+        return all_records
+
+    def _upload_to_s3(self, records: list[dict]):
+
+        "Key format: raw/mysql/year=YYYY/month=MM/day=DD/applications_RUNID.json"
+
+        now = datetime.now(timezone.utc)
+        s3_key = (
+            f"raw/mysql/"
+            f"year={now.year}/"
+            f"month={now.month:02d}/"
+            f"day={now.day:02d}/"
+            f"aplications_{self.run_id}.json"
+        )
+
+        payload = {
+            "metadata": {
+                "source": "mysql",
+                "table": TABLE_NAME,
+                "run_id": self.run_id,
+                "extracted_at": now.isoformat(),
+                "record_count": len(records)
+            },
+            "records": records
+        }
+        self.s3_client.put_object(
+            Bucket = self.bucket,
+            Key = s3_key,
+            Body = json.loads(payload, indent = 2, default = str),
+            ContentType = "Application/json",
+            Metadata = {
+                "source":       "mysql",
+                "record_count": str(len(records)),
+                "run_id":       self.run_id
+            }
+        )
+        full_path = f"s3://{self.bucket}/{s3_key}"
+        logger.info(f"Uploaded {len(records)} records to {full_path}")
+        return full_path
+
 
     def run(self):
-        pass
 
+        logger.info(f"Mysql extractor has started | run_id: {self.run_id}")
+        
+        result = {
+            "source": "Mysql",
+            "run_id": self.run_id,
+            "status": "Failed",
+            "records_extracted": 0,
+            "s3_path": None,
+            "Error": None
+        }
+
+        try:
+
+            last_extracted_at = self._read_state()
+            load_type = "incremental" if last_extracted_at else "Full"
+            logger.info(f"Load_type: {load_type.upper()}")
+
+            self._connect()
+
+            records = self._extract_all_records(last_extracted_at= last_extracted_at)
+            logger.info(f"Total records extracted: {len(records)}")
+
+            if not records:
+                logger.info("No new ot updated records found")
+                result["status"] = "Success"
+                result["records_extracted"] = 0
+                return result
+
+            s3_path = self._upload_to_s3(records= records)
+
+            self._write_state(records_extracted= len(records))
+
+            result.update({
+                "status": "Success",
+                "records_extracted": len(records),
+                "s3_path": s3_path,
+                "load_type": load_type
+            })
+
+        except pymysql.Error as e:
+            logger.error(f"Mysql error: {e}", exc_info= True)
+            result["Error"] = str(e)
+            self._write_state(records_extracted= 0 , status= "Filed")
+
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info= True)
+            result["Error"] = str(e)
+            self._write_state(records_extracted= 0 , status= "Filed")
+
+        finally:
+            self._disconnect()
+
+        return result
+
+if __name__ == "__main__":
+
+    extrtactor = MYSQLExtractor()
+    result = extrtactor.run()
+
+    for key, value in result.items():
+        print(f"{key}:{value}")

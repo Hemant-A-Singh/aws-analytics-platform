@@ -6,5 +6,6 @@ __pycache__/
 venv/
 
 z_test.py
+z_test_2.py
 
 z_test_data/
