@@ -7,6 +7,7 @@ import requests
 from typing import List, Dict, Any, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from config.settings import hubspot, aws, pipeline
+from loaders.s3_loader import S3Loader
 
 logging.basicConfig(level= getattr(logging, pipeline.LOG_LEVEL, logging.INFO),
                     format= "%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -16,7 +17,6 @@ logger = logging.getLogger(__name__)
 HUBSPOT_API_BASE = "https://api.hubapi.com"
 END_POINTS = "/crm/v3/objects/contacts/search"
 PAGE_SIZE = 100
-LAST_STATE_RUN_HUBSPOT = "logs/pipeline_runs/hubspot_state.json"
 MAX_RETRIES = 3
 
 CONTACT_PROPERTIES = [
@@ -42,67 +42,36 @@ class HubspotExtractor:
             "Content-Type":  "application/json"
             }
         
-        self.s3_client = self._init_s3_client()
-        self.s3_bucket = aws.S3_BUCKET
+        self.loader = S3Loader()
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
-    def _init_s3_client(self):
-        import boto3
+    # def _init_s3_client(self):
+    #     import boto3
 
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=aws.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=aws.AWS_SECRET_ACCESS_KEY,
-            region_name=aws.AWS_REGION
-        )
-        return s3
+    #     s3 = boto3.client(
+    #         "s3",
+    #         aws_access_key_id=aws.AWS_ACCESS_KEY_ID,
+    #         aws_secret_access_key=aws.AWS_SECRET_ACCESS_KEY,
+    #         region_name=aws.AWS_REGION
+    #     )
+    #     return s3
 
-    def _read_state(self):
-        
-        try:
+    def _read_state(self)->Optional[str]:
 
-            response = self.s3_client.get_object(
-                Bucket = self.s3_bucket,
-                Key = LAST_STATE_RUN_HUBSPOT
-            )
+        state = self.loader.read_state(source="hubspot")
+        return state.get("last_extracted_at") if state else None
 
-            state = json.loads(response["Body"].read().decode("utf-8"))
-            last_extracted_at = state.get("last_extracted_at")
-            logger.info(f"Last extracted at: {last_extracted_at}")
-            return last_extracted_at
-        
-        except self.s3_client.exceptions.NoSuchKey:
-            logger.info("No State file found, doing full load")
-            return None
-
-        except Exception as e:
-            logger.warning(f"No state file found: {e}- Defaulting to full load")
-            return None
         
     #-----------------write state--------------------------------------------------#
 
     def _write_state(self, records_extracted:int, status:str = "Success"):
-        try:
-            state = {
-                "last_extracted_at" : datetime.now(timezone.utc).isoformat(),
-                "last_run_status" : status,
-                "records_extracted": records_extracted,
-                "run_id": self.run_id
-            }
 
-            self.s3_client.put_object(
-                Bucket = self.s3_bucket,
-                Key = LAST_STATE_RUN_HUBSPOT,
-                Body = json.dumps(state, indent=2),
-                ContentType = "Application/json"
-            )
-
-            logger.info(f"State update: {records_extracted} records - {status} Status")
-
-        except Exception as e:
-            logger.info(f"Unable to connect to S3: {e}")
-
-       
+        self.loader.write_state(
+            source="hubspot",
+            run_id=self.run_id, 
+            records_extracted=records_extracted,
+            status= status
+            )     
     
     def _build_payload(self, last_extracted_at: Optional[str] = None, after: Optional[str]= None) -> Dict[str, Any]:
         
@@ -194,79 +163,9 @@ class HubspotExtractor:
         return all_contacts
     
     def _upload_to_s3(self, contacts: List[dict]):
-        
-        """Key format: raw/hubspot/year=YYYY/month=MM/day=DD/contacts_RUNID.json"""
-        
-        now = datetime.now(timezone.utc)
-
-        s3_key = (
-            f"raw/hubspot/"
-            f"year={now.year}/"
-            f"month={now.month:02d}/"
-            f"day={now.day:02d}/"
-            f"contacts_{self.run_id}.json"
-        )
-
-        payload = {
-            "metadata":{
-                "source": "hubspot",
-                "objects": "contacts",
-                "run_id": self.run_id,
-                "extracted_at": now.isoformat(),
-                "record_count": len(contacts)
-            },
-            "records": contacts
-        }
-
-        self.s3_client.put_object(
-            Bucket = self.s3_bucket,
-            Key = s3_key,
-            Body = json.dumps(payload, indent= 2, default= str).encode("utf-8"),
-            ContentType = "application/json",
-            Metadata = {
-                "source":       "hubspot",
-                "record_count": str(len(contacts)),
-                "run_id":       self.run_id
-            }
-        )
-
-        full_path = f"s3//{self.bucket}/{s3_key}"
-        logger.info(f"Uploaded {len(contacts)} contacts to {full_path}")
-
-        return full_path
     
-    def _upload_to_s3_dummy(self, contacts: List[dict]) -> str:
-        """Key format: raw/hubspot/year=YYYY/month=MM/day=DD/contacts_RUNID.json"""
-
-        now = datetime.now(timezone.utc)
-        key = (
-            f"z_test_data/"
-            f"year={now.year}/"
-            f"month={now.month:02d}/"
-            f"day={now.day:02d}/"
-            f"contacts_{self.run_id}.json"
-        )
-        
-        payload = {
-            "metadata":{
-                "source":"hubspot",
-                "object": "contacts",
-                "extracted_at": now.isoformat(),
-                "records_count": len(contacts),
-                "run_id": self.run_id
-            },
-            "records": contacts
-        }
-
-        Path(key).parent.mkdir(parents=True, exist_ok=True)
-        with open(key, "w", encoding="utf-8") as file:
-            json.dump(payload, file, indent=2, default=str)
-
-        logger.info(f"uploaded {len(contacts)} contacts to {key}")
-
-        return key
-        
-
+        return self.loader.upload_raw(data=contacts, source= "hubspot", entity="leads", run_id=self.run_id)
+    
     
     def run(self) -> Dict:
         

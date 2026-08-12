@@ -7,6 +7,7 @@ import pymysql
 import pymysql.cursors
 import boto3
 from tenacity import retry, stop_after_attempt, wait_exponential
+from loaders.s3_loader import S3Loader
 
 from config.settings import aws, mysql, pipeline
 
@@ -62,20 +63,19 @@ class MYSQLExtractor:
     
     def __init__(self):
 
-        self.s3_client = self._init_s3_client()
-        self.bucket = aws.S3_BUCKET
+        self.loader = S3Loader()
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         self.connection = None
 
-    def _init_s3_client(self):
+    # def _init_s3_client(self):
         
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id= aws.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key= aws.AWS_SECRET_ACCESS_KEY,
-            region_name= aws.AWS_REGION
-        )
-        return s3
+    #     s3 = boto3.client(
+    #         "s3",
+    #         aws_access_key_id= aws.AWS_ACCESS_KEY_ID,
+    #         aws_secret_access_key= aws.AWS_SECRET_ACCESS_KEY,
+    #         region_name= aws.AWS_REGION
+    #     )
+    #     return s3
     
     @retry(
             stop= stop_after_attempt(MAX_TRIES),
@@ -109,39 +109,17 @@ class MYSQLExtractor:
 
     def _write_state(self, records_extracted:int, status = "Success"):
         
-        state = {
-            "last_extracted_at": datetime.now(timezone.utc).isoformat(),
-            "last_run_status": status,
-            "records_extracted": records_extracted,
-            "run_id": self.run_id
-        }
+        self.loader.write_state(source="mysql",
+                                run_id=self.run_id,
+                                records_extracted=records_extracted,
+                                status=status
+                                )
 
-        self.s3_client.put_object(
-            Bucket = self.bucket,
-            Key = LAST_STATE_RUN_MYSQL,
-            Body = json.dumps(state, indent=2),
-            ContentType = "Application/json"
-        )
-        logger.info(f"State written - {records_extracted} records - Status: {status}")
 
     def _read_state(self) -> Optional[str]:
-        
-        try:
-            response = self.s3_client.get_object(
-                Bucket = self.bucket,
-                Key = LAST_STATE_RUN_MYSQL
-            )
-            state = json.loads(response["body"].read().decode("utf-8"))
-            last_extracted_at = state.get("last_extracted_at")
-            logger.info(f"State found - last extracted at: {last_extracted_at}")
-            return last_extracted_at
 
-        except self.s3_client.exceptions.NoSuchKey:
-            logger.info("No state file found - continuing with full load")
-            return None
-        except Exception as e:
-            logger.warning(f"Could not read state: {e} — defaulting to full load")
-            return None
+        return self.loader.read_state(source="mysql")
+        
 
     def _get_record_count(self,last_extracted_at: Optional[str]) -> int:
         
@@ -230,41 +208,12 @@ class MYSQLExtractor:
 
     def _upload_to_s3(self, records: list[dict]):
 
-        "Key format: raw/mysql/year=YYYY/month=MM/day=DD/applications_RUNID.json"
-
-        now = datetime.now(timezone.utc)
-        s3_key = (
-            f"raw/mysql/"
-            f"year={now.year}/"
-            f"month={now.month:02d}/"
-            f"day={now.day:02d}/"
-            f"aplications_{self.run_id}.json"
+        return self.loader.upload_raw(
+            data=records,
+            source="mysql",
+            entity="applications",
+            run_id=self.run_id
         )
-
-        payload = {
-            "metadata": {
-                "source": "mysql",
-                "table": TABLE_NAME,
-                "run_id": self.run_id,
-                "extracted_at": now.isoformat(),
-                "record_count": len(records)
-            },
-            "records": records
-        }
-        self.s3_client.put_object(
-            Bucket = self.bucket,
-            Key = s3_key,
-            Body = json.loads(payload, indent = 2, default = str),
-            ContentType = "Application/json",
-            Metadata = {
-                "source":       "mysql",
-                "record_count": str(len(records)),
-                "run_id":       self.run_id
-            }
-        )
-        full_path = f"s3://{self.bucket}/{s3_key}"
-        logger.info(f"Uploaded {len(records)} records to {full_path}")
-        return full_path
 
 
     def run(self):
