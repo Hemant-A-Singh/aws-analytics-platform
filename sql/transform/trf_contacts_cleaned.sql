@@ -11,6 +11,7 @@ email AS email_raw,
 email_clean,
 TRIM(COALESCE(first_name,'')) AS first_name,
 TRIM(COALESCE(last_name,'')) AS last_name,
+TRIM(COALESCE(first_name,'') || ' ' || COALESCE(last_name,'')) AS full_name,
 phone,
 TRIM(COALESCE(office,'')) AS office,
 CASE

@@ -9,6 +9,7 @@ import redshift_connector
 from typing import Optional
 import boto3
 
+
 logger = logging.getLogger(__name__)
 
 REDSHIFT_S3_ROLE_ARN = os.getenv("REDSHIFT_S3_ROLE_ARN", "")
@@ -201,7 +202,7 @@ class RedshiftTransformer:
 
         result = {
             "run_id": self.run_id,
-            "status": "Success",
+            "status": "Failed",
             "reconciliation": [],
             "Error": None
         }
@@ -247,11 +248,46 @@ class RedshiftTransformer:
 
 
             #--------------------------creating tranformation layer redshift---------------------------------------------------
-
+            logger.info("Step 3: Running transform layer...")
             transform_files = ["sql/transforms/trf_contacts_cleaned.sql",
                                 "sql/transforms/trf_applications_cleaned.sql",
                                 "sql/transforms/trf_entity_aligned.sql",
                                 "sql/transforms/trf_lead_funnel.sql"]
+            for filepath in transform_files:
+                self._execute_sql_file(filepath=filepath,layer="transform")
+
+            
+            
+
+
+            #--------------------------creating REPORTING layer redshift---------------------------------------------------
+            
+            logger.info("Step 4: Running reporting layer...")
+
+            reporting_files = [
+                "sql/reporting/dim_date.sql",
+                "sql/reporting/dim_counsellor.sql",
+                "sql/reporting/dim_lead_source.sql",
+                "sql/reporting/dim_institution.sql",
+                "sql/reporting/dim_office.sql"
+                "sql/reporting/fact_leads.sql",
+                "sql/reporting/fact_applications.sql",
+                "sql/reporting/fact_funnel.sql"
+            ]
+
+            for filepath in reporting_files:
+                self._execute_sql_file(filepath=filepath,layer="reporting")
+
+            result["status"] = "Success"
+            logger.info("Transformer completed successfully")
+
+        except Exception as e:
+            logger.info(f"Transformer failed, {e}", exc_info=True)
+            result["Error"] = str(e)
+        finally:
+            self._disconnect()
+
+        return result
 
 
 

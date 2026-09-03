@@ -41,4 +41,4 @@ GETDATE() AS _aligned_at
 FROM transform.trf_applications_cleaned app
 LEFT JOIN transform.trf_contacts_cleaned hs ON
 app.email_clean = hs.email_clean AND
-hs.email_clean = 1;
+hs.email_row_number = 1;

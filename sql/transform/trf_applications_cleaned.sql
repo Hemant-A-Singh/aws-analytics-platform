@@ -22,6 +22,7 @@ TRIM(COALESCE(country,'Unknown')) AS country,
 TRIM(COALESCE(app_status,'Unknown')) AS app_status,
 TRIM(COALESCE(coe_status,'Unknown')) AS coe_status,
 TRIM(COALESCE(student_status,'Unknown')) AS student_status,
+TRIM(COALESCE(offer_status,'Unknown')) AS offer_status
 COALESCE(NULLIF(TRIM(to_country),''),'Unknown') AS to_country,
 COALESCE(NULLIF(TRIM(institution),''),'Unknown') AS institution,
 representing_entity,
@@ -32,6 +33,21 @@ COALESCE(counsellor, 'Unknown')     AS counsellor,
 COALESCE(admission_officer, 'Unknown') AS admission_officer,
 COALESCE(owner, 'Unknown')          AS owner,
 COALESCE(office, 'Unknown')         AS office,
+CASE
+    WHEN LOWER(coe_status) LIKE '%received%' THEN 1
+    WHEN LOWER(coe_status) = '%wait%' THEN 2
+    ELSE 3 END AS best_coe_stage,
+CASE
+    WHEN LOWER(offer_status) LIKE '%full offer%' THEN 1
+    WHEN LOWER(offer_status) LIKE '%conditional offer%' THEN 2
+    WHEN LOWER(offer_status) LIKE '%wait%' THEN 3
+    WHEN LOWER(offer_status) LIKE '%reject%' OR LOWER(offer_status) = '%withdrawn%' THEN 4
+    END AS best_offer_stage,
+CASE
+    WHEN LOWER(student_status) LIKE '%enroll%' THEN 1
+    WHEN LOWER(student_status) LIKE '%course completed%' THEN 1
+    ELSE 2 END AS best_student_status_stage,
+ 
 CASE
     WHEN office = 'JHG-Saudi' THEN 'JHG-Saudi'
     WHEN office = 'JHG-Oman' THEN 'JHG-Oman'
