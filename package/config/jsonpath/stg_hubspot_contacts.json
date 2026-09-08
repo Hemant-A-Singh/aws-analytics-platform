@@ -1,0 +1,22 @@
+{
+    "jsonpaths": [
+        "$.records[*].Contact_id",
+        "$.records[*].Email",
+        "$.records[*].Email",
+        "$.records[*].hs_object_id",
+        "$.records[*].First_Name",
+        "$.records[*].Last_Name",
+        "$.records[*].Phone",
+        "$.records[*].Office",
+        "$.records[*].Student_status",
+        "$.records[*].counsellor",
+        "$.records[*].country",
+        "$.records[*].lead_source",
+        "$.records[*].country_of_passport",
+        "$.records[*].interested_destination",
+        "$.records[*].createdate",
+        "$.records[*].Last_Modified_Date",
+        "$.records[*].extracted_at",
+        "$.records[*]._run_id"
+    ]
+}
