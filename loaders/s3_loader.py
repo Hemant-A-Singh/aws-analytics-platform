@@ -11,16 +11,24 @@ logger = logging.getLogger(__name__)
 class S3Loader:
 
     RAW_FILE_PATH = "raw/{source}/year={year}/month={month:02d}/day={day:02d}/{entity}_{run_id}.json"
-    STATE_FILE_PATH = "logs/pipeline_runs/{source}_state.json"
+    S3_STATE_FILE_PATH = "logs/pipeline_runs/{source}_state.json"
+    REDSHIFT_STATE_FILE_PATH = "logs/pipeline_runs/redshift_state.json"
     LOG_FILE_PATH = "logs/pipeline_runs/{run_id}_run_log.json"
 
     def __init__(self):
-        self.client = boto3.client(
-            "s3",
-            aws_access_key_id = aws.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key = aws.AWS_SECRET_ACCESS_KEY,
-            region_name = aws.AWS_REGION
-        )
+        self.client = self._make_boto3_client("s3")
+
+    def _make_boto3_client(self, service_name:str):
+
+        if aws.AWS_ACCESS_KEY_ID and aws.AWS_SECRET_ACCESS_KEY:
+            return boto3.client(
+                service_name,
+                aws_access_key_id = aws.AWS_ACCESS_KEY_ID,
+                aws_secret_access_key = aws.AWS_SECRET_ACCESS_KEY,
+                region_name = aws.AWS_REGION
+            )
+        else:
+            return boto3.client(service_name, region_name = aws.AWS_REGION)
 
     def raw_path(self, source:str, entity:str, run_id:str)->str:
 
@@ -34,8 +42,11 @@ class S3Loader:
             run_id = run_id
         )
 
-    def state_path(self, source:str)->str:
-        return self.STATE_FILE_PATH.format(source = source)
+    def s3_state_path(self, source:str)->str:
+        return self.S3_STATE_FILE_PATH.format(source = source)
+
+    def redshift_state_path(self)->str:
+        return self.REDSHIFT_STATE_FILE_PATH
 
     def log_path(self, run_id:str):
         return self.LOG_FILE_PATH.format(run_id=run_id)
@@ -91,7 +102,7 @@ class S3Loader:
 
     def read_state(self, source:str)->Optional[dict]:
 
-        key = self.state_path(source=source)
+        key = self.s3_state_path(source=source)
 
         try:
             response = self.client.get_object(Bucket = aws.S3_BUCKET, Key = key)
@@ -107,7 +118,7 @@ class S3Loader:
 
     def write_state(self, source:str, run_id:str, records_extracted:int, status:str= "Success", extra: Optional[dict]=None):
 
-        key = self.state_path(source=source)
+        key = self.s3_state_path(source=source)
         payload = {
             "source": source,
             "run_id": run_id,
@@ -121,6 +132,35 @@ class S3Loader:
 
         self.upload(key=key, body=body)
         logger.info(f"{source} state written in S3, records_extracted: {records_extracted}, Status: {status}")
+
+    def read_redshift_state(self)->Optional[dict]:
+        key = self.redshift_state_path()
+
+        try:
+            response = self.client.get_object(Bucket= aws.S3_BUCKET, Key= key)
+            state = json.loads(response["Body"].read().decode("utf-8"))
+            logger.info(f"state: {state}, last_extracted_at: {state.get("last_extracted_at")}")
+            return state
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                logger.info(f"[Redshift] No state file found — will run full load")
+                return None
+
+    def write_redshift_state(self, run_id:str, hs_records_extracted:int, my_records_extracted:int, status:str= "Success", extra: Optional[dict]=None):
+
+        key = self.redshift_state_path()
+
+        payload = {
+            "source": "redshift",
+            "run_id": run_id,
+            "last_extracted_at": datetime.now(timezone.utc).isoformat(),
+            "hs_records_extracted": hs_records_extracted,
+            "my_records_extracted": my_records_extracted,
+            "status": status
+        }
+        body = json.dumps(payload, indent=2, default=str).encode("utf-8")
+        self.upload(key=key, body= body)
+        logger.info(f"Redshift state written in S3, records_extracted: {records_extracted}, Status: {status}")
 
     def write_run_log(self, run_id:str, log_data:dict)->str:
 

@@ -5,11 +5,19 @@ from datetime import datetime, timezone
 import boto3
 import os
 
+_PIPELINE_ENV = os.getenv("PIPELINE_ENV", "development")
+
+if _PIPELINE_ENV == "production":
+    from config.secrets import get_secrets_loader
+    secrets_loader = get_secrets_loader()
+    secrets_loader.inject_into_environment()
+
 from extractors.hubspot_extractor import HubspotExtractor
 from extractors.mysql_extractor import MYSQLExtractor
 from loaders.s3_loader import S3Loader
 from transformers.red_shift_transformer import RedshiftTransformer
 from config.settings import aws, pipeline
+from transformers.data_quality import DataQualityChecker
 
 logging.basicConfig(level= getattr(logging, pipeline.LOG_LEVEL, logging.INFO),
                     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -150,6 +158,47 @@ def lambda_handler(event:dict, context)->dict:
                 logger.error(f"Transformer Failed: {e}", exc_info=True)
 
         run_log["steps"].append(tf_result)
+
+        dq_summary = {
+            "overall_status": "skipped",
+            "total_checks":   0,
+            "passed":         0,
+            "critical":       0,
+            "warnings":       0
+        }
+        if tf_result["status"].lower() == "success":
+            try:
+                logger.info("── Step 4: Data Quality Checks ──")
+                dq_checker = DataQualityChecker()
+                dq_summary = dq_checker.run_all_checks()
+                run_log["data_quality"] = dq_summary
+                logger.info(
+                    f"DQ: {dq_summary['overall_status'].upper()} | "
+                    f"{dq_summary['passed']}/{dq_summary['total_checks']} passed | "
+                    f"critical={dq_summary['critical']}"
+                    )
+            except Exception as e:
+                dq_summary["error"] = str(e)
+                logger.error(f"DQ checks failed: {e}", exc_info=True)
+        else:
+            logger.info("Step 4: Skipping DQ checks (transformer did not succeed)")
+
+        run_log["steps"].append({
+            "name": "Data quality Checks",
+            "status": dq_summary.get("Overall_status","Skipped"),
+            "passed": dq_summary.get("passed",0),
+            "total": dq_summary.get("total",0)
+        })
+
+        if tf_result["status"] != "success":
+            run_log["pipeline_status"] = "failed"
+        elif dq_summary.get("critical", 0) > 0:
+            # DQ critical failures = data is bad, flag the run
+            run_log["pipeline_status"] = "dq_failed"
+        elif dq_summary.get("warnings", 0) > 0:
+            run_log["pipeline_status"] = "success_with_warnings"
+        else:
+            run_log["pipeline_status"] = "success"
 
         if tf_result["status"].lower() == "success":
             run_log["pipeline_status"] = "Success"

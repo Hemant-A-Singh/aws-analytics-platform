@@ -40,6 +40,7 @@ class RedshiftTransformer:
 
         self.conn = None
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        self.loader = S3Loader()
 
     def _connect(self):
 
@@ -80,19 +81,28 @@ class RedshiftTransformer:
             logger.info(f"[{layer}] {filepath} Failed - ROOLEDBACK: {e}")
             raise
 
-    def _get_s3_latest_files(self, source:str)-> Optional[str]:
+    def _get_s3_latest_files(self, source:str)-> Optional[list[str]]:
 
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id = aws.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key = aws.AWS_SECRET_ACCESS_KEY,
-            region_name = aws.AWS_REGION
-        )
+        if aws.AWS_ACCESS_KEY_ID and aws.AWS_SECRET_ACCESS_KEY:
+            s3 = boto3.client(
+                "s3",
+                aws_access_key_id = aws.AWS_ACCESS_KEY_ID,
+                aws_secret_access_key = aws.AWS_SECRET_ACCESS_KEY,
+                region_name = aws.AWS_REGION
+            )
+        else:
+            s3 = boto3.client("s3", region_name = aws.AWS_REGION)
+
+        redshift_state = self.loader.read_redshift_state()
+        last_loaded_redshift = datetime.fromisoformat(redshift_state.get("last_extracted_at"))
+        load_year = last_loaded_redshift.year
+        load_month = last_loaded_redshift.month
+        load_week = last_loaded_redshift.isocalendar()[1]
 
         paginator = s3.get_paginator("list_objects_v2")
         pages = paginator.paginate(
             Bucket = aws.S3_BUCKET,
-            Prefix = f"raw/{source}"
+            Prefix = f"raw/{source}/"
         )
 
         all_objects = []
@@ -102,11 +112,12 @@ class RedshiftTransformer:
 
         if not all_objects:
             logger.warning(f"No file found under: raw/{source}")
-            return None
+            return []
 
-        latest = sorted(all_objects, key= lambda x: x["LastModified"], reverse= True)[0]
-        logger.info(f"Latest {source} file: {latest['Key']}, {latest['LastModified']}")
-        return latest['Key']
+        #latest = sorted(all_objects, key= lambda x: x["LastModified"], reverse= True)[0]
+        latest = [x['Key'] for x in all_objects if x["LastModified"]>=last_loaded_redshift]
+        logger.info(f"Latest {source} files: {latest}")
+        return latest 
 
     def _copy_json_to_staging(
             self,
@@ -121,7 +132,7 @@ class RedshiftTransformer:
 
         cursor = self.conn.cursor()
 
-        cursor.execute(f"trauncate table {target_table}")
+#        cursor.execute(f"trauncate table {target_table}")
 
         sql_copy = f"""
                     COPY {target_table}
@@ -151,7 +162,7 @@ class RedshiftTransformer:
     def _post_copy_cleanup(self, table:str, email_col:str="email")->None:
 
         cursor = self.conn.cursor()
-        query = f"""update table {table}
+        query = f"""update {table}
                     set email_clean = lower(trim({email_col}))
                     where {email_col} is not NULL
                     """
@@ -166,11 +177,7 @@ class RedshiftTransformer:
             logger.info(f"Post Copy cleanup failed for {table}")
             raise
 
-    def _reconcile(self, source_count:int, target_table:str)->dict:
-
-        cursor = self.conn.cursor()
-        cursor.execute(f"select count(*) from {target_table}")
-        target_count = cursor.fetchone()[0]
+    def _reconcile(self, source_count:int, target_count:int, target_table:str)->dict:
 
         match = source_count == target_count
         discrepancy = abs(source_count - target_count)
@@ -185,11 +192,11 @@ class RedshiftTransformer:
         }
 
         if match:
-            logger.info(f"Reconciliation PASSED: {target_table} — {target_count} rows match")
+            logger.info(f"Reconciliation PASSED: {target_count} — {target_count} rows match")
 
         else:
             logger.warning(
-                f"Reconciliation Mismatched: {target_table} - "
+                f"Reconciliation Mismatched: {target_count} - "
                 f"Source: {source_count}, Target: {target_count}, Discrepancy: {discrepancy}"
             )
 
@@ -210,6 +217,7 @@ class RedshiftTransformer:
         try:
 
             self._connect()
+            cursor = self.conn.cursor()
 
             logger.info(f"Step-1, Creating staging tables...")
             self._execute_sql_file("sql/staging/stg_hubspot_contacts.sql","Staging")
@@ -218,34 +226,41 @@ class RedshiftTransformer:
             logger.info("Staging Tables Created Successfully")
             logger.info("Step-2, Loading S3 data into Staging tables")
 
-            hs_key = self._get_s3_latest_files(source="hubspot")
+            hs_keys = self._get_s3_latest_files(source="hubspot")
+            for key in hs_keys:
 
-            if hs_key:
-                self._copy_json_to_staging(
-                    s3_key= hs_key,
-                    target_table= "staging.stg_hubspot_contacts"
-                )
-                self._post_copy_cleanup(table="staging.stg_hubspot_contacts")
-                hs_reconciliation = self._reconcile(source_count= hubspot_record_count, target_table="staging.stg_hubspot_contacts")
-                result["reconciliation"].append(hs_reconciliation)
-
-            else:
-                logger.info(f"No HS_S3 file found- skipping copy")
-
-            my_key = self._get_s3_latest_files(source="mysql")
-
-            if my_key:
-                self._copy_json_to_staging(
-                    s3_key=my_key, 
-                    target_table= "staging.stg_mysql_applications"
+                if key:
+                    self._copy_json_to_staging(
+                        s3_key= key,
+                        target_table= "staging.stg_hubspot_contacts"
                     )
-                self._post_copy_cleanup(table="staging.stg_mysql_applications")
-                my_reconciliation = self._reconcile(source_count=mysql_record_count, target_table="staging.stg_mysql_applications")
-                result["reconciliation"].append(my_reconciliation)
+                    
+                else:
+                    logger.info(f"No HS_S3 file found- skipping copy")
 
-            else:
-                logger.info(f"No Mysql-s3 file found - Skipping copy")
+            self._post_copy_cleanup(table="staging.stg_hubspot_contacts")
+            cursor.execute("select count(*) from staging.stg_hubspot_contacts")
+            hs_target_count = cursor.fetchone()[0]
+            hs_reconciliation = self._reconcile(source_count= hubspot_record_count, target_count=hs_target_count, target_table="staging.stg_hubspot_contacts")
+            result["reconciliation"].append(hs_reconciliation)
 
+
+            my_keys = self._get_s3_latest_files(source="mysql")
+            for key in my_keys:
+                if key:
+                    self._copy_json_to_staging(
+                        s3_key=key, 
+                        target_table= "staging.stg_mysql_applications"
+                        )
+
+                else:
+                    logger.info(f"No Mysql-s3 file found - Skipping copy")
+
+            self._post_copy_cleanup(table="staging.stg_mysql_applications")
+            cursor.execute("select count(*) from staging.stg_mysql_applications")
+            my_target_count = cursor.fetchone()[0]
+            my_reconciliation = self._reconcile(source_count= mysql_record_count, target_count=my_target_count, target_table="staging.stg_mysql_applications")
+            result["reconciliation"].append(my_reconciliation)
 
             #--------------------------creating tranformation layer redshift---------------------------------------------------
             logger.info("Step 3: Running transform layer...")
@@ -269,7 +284,7 @@ class RedshiftTransformer:
                 "sql/reporting/dim_counsellor.sql",
                 "sql/reporting/dim_lead_source.sql",
                 "sql/reporting/dim_institution.sql",
-                "sql/reporting/dim_office.sql"
+                "sql/reporting/dim_office.sql",
                 "sql/reporting/fact_leads.sql",
                 "sql/reporting/fact_applications.sql",
                 "sql/reporting/fact_funnel.sql"
@@ -279,7 +294,14 @@ class RedshiftTransformer:
                 self._execute_sql_file(filepath=filepath,layer="reporting")
 
             result["status"] = "Success"
-            logger.info("Transformer completed successfully")
+            
+            self.loader.write_redshift_state(
+                run_id= self.run_id,
+                hs_records_extracted= hs_target_count,
+                my_records_extracted= my_target_count,
+                status= "Success"
+            )
+            logger.info("Transformer completed successfully")           
 
         except Exception as e:
             logger.info(f"Transformer failed, {e}", exc_info=True)
